@@ -15,6 +15,10 @@ texts/
 !skills/**/*.md
 !finetune/*.md
 !docs/*.md
+# Search-quality fixtures are markdown by design; without this they are
+# silently untracked and the eval suites fail on a fresh clone.
+!test/eval-docs/*.md
+!test/eval-docs-long/*.md
 finetune/outputs/
 finetune/data/train/
 .claude/

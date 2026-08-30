@@ -4665,6 +4665,131 @@ describe("Embedding batching", () => {
     }
   });
 
+  // Regression tests for the chunk that vector search actually matched.
+  //
+  // hybridQuery re-chunks each candidate's full body at query time and used to
+  // re-pick a passage by counting query words. In a book-length document that
+  // is mostly noise — common query words occur in thousands of chunks — so the
+  // passage the embedding matched routinely lost to lexical coincidence.
+  // Fixtures below make the two disagree on purpose: an early keyword-dense
+  // region, and a later region that holds the answer but almost no query words.
+
+  /**
+   * Body whose keyword-best chunk and answer chunk are far apart.
+   *
+   * `long` exceeds LONG_DOC_CHUNK_COUNT, where keyword overlap degenerates into
+   * noise and the vector-matched chunk is preferred; `short` stays below it,
+   * where keyword overlap is the better signal and keeps priority.
+   */
+  function splitBrainBody(size: "long" | "short"): { body: string; answerPos: number } {
+    const reps = size === "long" ? 3000 : 400;
+    const filler = "alpha beta gamma delta ".repeat(reps);  // dense in query terms
+    const marker = "MARKER_ANSWER the choroid plexus produces cerebrospinal fluid.";
+    const body = `${filler}\n\n${marker}\n\n${"padding ".repeat(200)}`;
+    return { body, answerPos: body.indexOf("MARKER_ANSWER") };
+  }
+
+  async function runHybridWithVecHit(chunkPos: number | undefined, size: "long" | "short" = "long") {
+    const store = await createTestStore();
+    const collection = await createTestCollection({ name: "books", pwd: "/test/books" });
+    const model = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
+    const { body, answerPos } = splitBrainBody(size);
+    const filepath = `qmd://${collection}/book.md`;
+
+    store.db.exec(`CREATE TABLE vectors_vec (hash_seq TEXT PRIMARY KEY, embedding BLOB)`);
+    store.llm = {
+      embedModelName: model,
+      embedBatch: async (texts: string[]) => texts.map(() => ({ embedding: [1, 2, 3], model })),
+    } as never;
+    store.expandQuery = (async () => []) as never;
+    store.searchFTS = (() => []) as never;
+    store.searchVec = (async () => [{
+      filepath,
+      displayPath: `${collection}/book.md`,
+      title: "Book",
+      hash: "bookhash",
+      docid: "#book01",
+      collectionName: collection,
+      modifiedAt: "",
+      bodyLength: body.length,
+      body,
+      context: null,
+      score: 0.8,
+      source: "vec" as const,
+      ...(chunkPos === undefined ? {} : { chunkPos }),
+    }] as SearchResult[]) as never;
+
+    try {
+      const results = await hybridQuery(store, "alpha beta gamma", {
+        limit: 5, minScore: 0, skipRerank: true,
+      });
+      return { results, answerPos };
+    } finally {
+      await cleanupTestDb(store);
+    }
+  }
+
+  test("hybridQuery prefers the vector-matched chunk in a long document", async () => {
+    const { body, answerPos } = splitBrainBody("long");
+    expect(answerPos).toBeGreaterThan(0);
+    // Fixture sanity: the answer is far enough in to land in a later chunk.
+    expect(body.slice(0, 2000)).not.toContain("MARKER_ANSWER");
+
+    const { results } = await runHybridWithVecHit(answerPos, "long");
+
+    expect(results).toHaveLength(1);
+    // The matched chunk wins even though it contains none of the query terms.
+    expect(results[0]!.bestChunk).toContain("MARKER_ANSWER");
+  });
+
+  test("hybridQuery keeps keyword selection in a short document", async () => {
+    // Below LONG_DOC_CHUNK_COUNT the keyword signal is reliable — the section
+    // answering a question generally contains the question's words — so a
+    // vector match must not displace it. Preferring matches unconditionally
+    // regressed the passage-level eval on note-sized documents.
+    const { answerPos } = splitBrainBody("short");
+    const { results } = await runHybridWithVecHit(answerPos, "short");
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.bestChunk).toContain("alpha beta gamma");
+    expect(results[0]!.bestChunk).not.toContain("MARKER_ANSWER");
+  });
+
+  test("hybridQuery falls back to keyword selection when no chunk position is known", async () => {
+    // Guards the long-document test: with no chunkPos the lexical pick is used
+    // even in a long document, so a regression that ignores chunkPos fails that
+    // test rather than this one.
+    const { results } = await runHybridWithVecHit(undefined, "long");
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.bestChunk).not.toContain("MARKER_ANSWER");
+    expect(results[0]!.bestChunk).toContain("alpha beta gamma");
+  });
+
+  test("reciprocalRankFusion keeps every matched chunk offset for a file", () => {
+    const mk = (file: string, score: number, chunkPos?: number): RankedResult => ({
+      file, displayPath: file, title: file, body: "", score,
+      ...(chunkPos === undefined ? {} : { chunkPos }),
+    });
+    // Same document matched at two different offsets by two expanded queries,
+    // plus an FTS list that knows no offset at all.
+    const vecA: RankedResult[] = [mk("qmd://c/a.md", 0.9, 1000)];
+    const vecB: RankedResult[] = [mk("qmd://c/a.md", 0.8, 5000)];
+    const fts: RankedResult[] = [mk("qmd://c/a.md", 0.7)];
+
+    const fused = reciprocalRankFusion([vecA, vecB, fts]);
+    expect(fused).toHaveLength(1);
+    expect(fused[0]!.chunkPositions).toEqual([1000, 5000]);
+  });
+
+  test("reciprocalRankFusion reports no offsets when no backend supplied one", () => {
+    const fts: RankedResult[] = [
+      { file: "qmd://c/a.md", displayPath: "a", title: "A", body: "", score: 0.5 },
+    ];
+    const fused = reciprocalRankFusion([fts]);
+    expect(fused[0]!.chunkPositions).toEqual([]);
+  });
+
   test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {
     const store = await createTestStore();
     const model = "hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf";

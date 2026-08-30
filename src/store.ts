@@ -2430,6 +2430,10 @@ export type RankedResult = {
   title: string;
   body: string;
   score: number;
+  /** Byte offset of the chunk that matched, when the backend knows it (vec). */
+  chunkPos?: number;
+  /** Set by reciprocalRankFusion: every matched offset for this file. */
+  chunkPositions?: number[];
 };
 
 export type RRFContributionTrace = {
@@ -4621,7 +4625,7 @@ export function reciprocalRankFusion(
   weights: number[] = [],
   k: number = 60
 ): RankedResult[] {
-  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number }>();
+  const scores = new Map<string, { result: RankedResult; rrfScore: number; topRank: number; chunkPositions: number[] }>();
 
   for (let listIdx = 0; listIdx < resultLists.length; listIdx++) {
     const list = resultLists[listIdx];
@@ -4637,11 +4641,15 @@ export function reciprocalRankFusion(
       if (existing) {
         existing.rrfScore += rrfContribution;
         existing.topRank = Math.min(existing.topRank, rank);
+        if (result.chunkPos !== undefined) existing.chunkPositions.push(result.chunkPos);
       } else {
         scores.set(result.file, {
           result,
           rrfScore: rrfContribution,
           topRank: rank,
+          // Which chunk matched is per-result, not per-file: keep every offset
+          // so a document that matched in several places can surface each one.
+          chunkPositions: result.chunkPos !== undefined ? [result.chunkPos] : [],
         });
       }
     }
@@ -4658,7 +4666,7 @@ export function reciprocalRankFusion(
 
   return Array.from(scores.values())
     .sort((a, b) => b.rrfScore - a.rrfScore)
-    .map(e => ({ ...e.result, score: e.rrfScore }));
+    .map(e => ({ ...e.result, score: e.rrfScore, chunkPositions: [...new Set(e.chunkPositions)] }));
 }
 
 /**
@@ -5483,6 +5491,42 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
  * 8. Dedup by file, filter by minScore, slice to limit
  */
 /**
+ * Chunk count above which a document is treated as "long" for chunk selection.
+ *
+ * Keyword overlap is a dependable signal in a short document — the section that
+ * answers a question usually contains the question's words, and there are few
+ * enough sections that a coincidence is unlikely. In a long document it is
+ * noise: the chance of some unrelated passage scoring highly on common words
+ * grows with the number of passages, so in a book thousands of chunks tie on
+ * "the" and "data". Below this threshold keyword selection is trusted; above
+ * it, the chunk vector search actually matched is preferred.
+ *
+ * 16 sits far above ordinary notes and documentation pages (2-4 chunks) and far
+ * below book-length sources (hundreds to thousands).
+ */
+const LONG_DOC_CHUNK_COUNT = 16;
+
+/**
+ * Map byte offsets recorded at embed time onto the chunk list produced at query
+ * time. The two chunkings can drift (different strategy or chunk size), so this
+ * takes the last chunk starting at or before the offset rather than requiring
+ * an exact hit. Chunks are ordered by `pos`, so a binary search suffices.
+ */
+function chunkIndicesForPositions(chunks: { pos: number }[], positions: number[]): number[] {
+  if (chunks.length === 0) return [];
+  const out: number[] = [];
+  for (const target of positions) {
+    let lo = 0, hi = chunks.length - 1, best = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (chunks[mid]!.pos <= target) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+    }
+    out.push(best);
+  }
+  return out;
+}
+
+/**
  * Rerank identity for one chunk.
  *
  * store.rerank() groups by the `file` field, so sending several chunks from the
@@ -5613,6 +5657,7 @@ export async function hybridQuery(
         rankedLists.push(vecResults.map(r => ({
           file: r.filepath, displayPath: r.displayPath,
           title: r.title, body: r.body || "", score: r.score,
+          chunkPos: r.chunkPos,
         })));
         rankedListMeta.push({
           source: "vec",
@@ -5666,10 +5711,26 @@ export async function hybridQuery(
       }
       return { i, score };
     });
-    // Ties break toward earlier chunks, matching the previous `score > bestScore`
-    // scan, so maxPerFile = 1 selects exactly the chunk the old code did.
+    // Ties break toward earlier chunks, matching the old `score > bestScore` scan.
+    // This is now the fallback ordering: vector-matched chunks are preferred below.
     scored.sort((a, b) => (b.score - a.score) || (a.i - b.i));
-    const selectedIdxs = scored.slice(0, maxPerFile).map(e => e.i);
+
+    // In a long document, prefer the chunks vector search actually matched:
+    // without this the semantically-matched passage is discarded and chunks are
+    // re-picked by raw keyword overlap, which at book length is mostly noise.
+    // In a short document keyword overlap is the better signal, so it leads and
+    // matched chunks only fill any remaining maxPerFile slots.
+    const matchedIdxs = chunkIndicesForPositions(chunks, cand.chunkPositions ?? []);
+    const keywordIdxs = scored.map(e => e.i);
+    const order = chunks.length >= LONG_DOC_CHUNK_COUNT
+      ? [...matchedIdxs, ...keywordIdxs]
+      : [...keywordIdxs, ...matchedIdxs];
+
+    const selectedIdxs: number[] = [];
+    for (const idx of order) {
+      if (selectedIdxs.length >= maxPerFile) break;
+      if (!selectedIdxs.includes(idx)) selectedIdxs.push(idx);
+    }
     const bestIdx = selectedIdxs[0] ?? 0;
 
     docChunkMap.set(cand.file, { chunks, bestIdx, selectedIdxs });
