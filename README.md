@@ -659,7 +659,23 @@ qmd query "auth flow" --chunk-strategy auto
 # Memory control for large corpora / constrained systems
 qmd embed --max-docs-per-batch 50   # cap docs per embedding batch
 qmd embed --max-batch-mb 64         # cap batch size in MB
+
+# Time limit for one embed session (minutes; default 30, 0 = no limit)
+qmd embed --timeout 240             # allow up to four hours
+qmd embed --timeout 0               # no limit
 ```
+
+**Embed session timeout** (`--timeout`) caps how long a single `qmd embed` run
+may take. The default is 30 minutes. A corpus that needs longer than the cap is
+cut short: the session aborts, partially embedded documents are discarded, and
+the run reports `Session expired`. Resuming can then fail to converge, because a
+document only counts as embedded once all of its chunks are, so each run may
+discard work the previous one did.
+
+Large corpora — book-length sources especially, and CPU-only machines — will
+routinely need more than 30 minutes. Raise the cap with `--timeout <minutes>`,
+or remove it entirely with `--timeout 0`, rather than re-running `qmd embed`
+repeatedly and hoping it catches up.
 
 **AST-aware chunking** (`--chunk-strategy auto`) uses tree-sitter to chunk code
 files at function, class, and import boundaries instead of arbitrary text
