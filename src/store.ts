@@ -5430,6 +5430,7 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  maxPerFile?: number;      // max passages returned from one document; default 1
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
@@ -5481,6 +5482,25 @@ export function getHybridRrfWeights(rankedListMeta: RankedListMeta[]): number[] 
  * 7. Position-aware score blending (RRF rank × reranker score)
  * 8. Dedup by file, filter by minScore, slice to limit
  */
+/**
+ * Rerank identity for one chunk.
+ *
+ * store.rerank() groups by the `file` field, so sending several chunks from the
+ * same document under the same path would collapse them. The reranker's own
+ * cache keys on chunk text (not path), so a synthetic per-chunk key is safe
+ * here and keeps the change out of the shared rerank API. NUL cannot occur in
+ * a path, so the split is unambiguous.
+ */
+function chunkRerankKey(file: string, chunkIdx: number): string {
+  return `${file}\u0000${chunkIdx}`;
+}
+
+function parseChunkRerankKey(key: string): { file: string; chunkIdx: number } {
+  const sep = key.lastIndexOf("\u0000");
+  if (sep === -1) return { file: key, chunkIdx: 0 };
+  return { file: key.slice(0, sep), chunkIdx: Number(key.slice(sep + 1)) || 0 };
+}
+
 export async function hybridQuery(
   store: Store,
   query: string,
@@ -5493,6 +5513,9 @@ export async function hybridQuery(
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
+  // How many passages one document may contribute. Default 1 preserves the
+  // historic one-result-per-file behaviour exactly.
+  const maxPerFile = Math.max(1, Math.floor(options?.maxPerFile ?? 1));
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -5626,38 +5649,44 @@ export async function hybridQuery(
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
-  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number; selectedIdxs: number[] }>();
 
   const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
     const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
     if (chunks.length === 0) continue;
 
-    // Pick chunk with most keyword overlap (fallback: first chunk)
+    // Score every chunk by keyword overlap, then keep the best `maxPerFile`.
     // Intent terms contribute at INTENT_WEIGHT_CHUNK (0.5) relative to query terms (1.0)
-    let bestIdx = 0;
-    let bestScore = -1;
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkLower = chunks[i]!.text.toLowerCase();
+    const scored = chunks.map((chunk, i) => {
+      const chunkLower = chunk.text.toLowerCase();
       let score = queryTerms.reduce((acc, term) => acc + (chunkLower.includes(term) ? 1 : 0), 0);
       for (const term of intentTerms) {
         if (chunkLower.includes(term)) score += INTENT_WEIGHT_CHUNK;
       }
-      if (score > bestScore) { bestScore = score; bestIdx = i; }
-    }
+      return { i, score };
+    });
+    // Ties break toward earlier chunks, matching the previous `score > bestScore`
+    // scan, so maxPerFile = 1 selects exactly the chunk the old code did.
+    scored.sort((a, b) => (b.score - a.score) || (a.i - b.i));
+    const selectedIdxs = scored.slice(0, maxPerFile).map(e => e.i);
+    const bestIdx = selectedIdxs[0] ?? 0;
 
-    docChunkMap.set(cand.file, { chunks, bestIdx });
+    docChunkMap.set(cand.file, { chunks, bestIdx, selectedIdxs });
   }
 
   if (skipRerank) {
     // Skip LLM reranking — return candidates scored by RRF only
-    const seenFiles = new Set<string>();
+    const seenChunks = new Set<string>();
     return candidates
-      .map((cand, i) => {
+      .flatMap((cand, i) => {
         const chunkInfo = docChunkMap.get(cand.file);
-        const bestIdx = chunkInfo?.bestIdx ?? 0;
-        const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
-        const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+        const idxs = chunkInfo?.selectedIdxs?.length ? chunkInfo.selectedIdxs : [chunkInfo?.bestIdx ?? 0];
+        return idxs.map(idx => ({ cand, i, chunkInfo, idx }));
+      })
+      .map(({ cand, i, chunkInfo, idx }) => {
+        const bestChunk = chunkInfo?.chunks[idx]?.text || cand.body || "";
+        const bestChunkPos = chunkInfo?.chunks[idx]?.pos || 0;
         const rrfRank = i + 1;
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
@@ -5691,8 +5720,11 @@ export async function hybridQuery(
         };
       })
       .filter(r => {
-        if (seenFiles.has(r.file)) return false;
-        seenFiles.add(r.file);
+        // Dedup on (file, chunk) so one document can contribute several
+        // passages while identical passages still collapse.
+        const key = `${r.file}\u0000${r.bestChunkPos}`;
+        if (seenChunks.has(key)) return false;
+        seenChunks.add(key);
         return true;
       })
       .filter(r => r.score >= minScore)
@@ -5703,8 +5735,12 @@ export async function hybridQuery(
   const chunksToRerank: { file: string; text: string }[] = [];
   for (const cand of candidates) {
     const chunkInfo = docChunkMap.get(cand.file);
-    if (chunkInfo) {
-      chunksToRerank.push({ file: cand.file, text: chunkInfo.chunks[chunkInfo.bestIdx]!.text });
+    if (!chunkInfo) continue;
+    const idxs = chunkInfo.selectedIdxs.length ? chunkInfo.selectedIdxs : [chunkInfo.bestIdx];
+    for (const idx of idxs) {
+      const chunk = chunkInfo.chunks[idx];
+      if (!chunk) continue;
+      chunksToRerank.push({ file: chunkRerankKey(cand.file, idx), text: chunk.text });
     }
   }
 
@@ -5720,7 +5756,10 @@ export async function hybridQuery(
   }]));
   const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
 
-  const blended = reranked.map(r => {
+  const blended = reranked.map(rawResult => {
+    // Rerank ran on per-chunk keys; recover the real path and chunk index.
+    const { file: rFile, chunkIdx } = parseChunkRerankKey(rawResult.file);
+    const r = { ...rawResult, file: rFile };
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
     let rrfWeight: number;
     if (rrfRank <= 3) rrfWeight = 0.75;
@@ -5731,9 +5770,8 @@ export async function hybridQuery(
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
-    const bestIdx = chunkInfo?.bestIdx ?? 0;
-    const bestChunk = chunkInfo?.chunks[bestIdx]?.text || candidate?.body || "";
-    const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
+    const bestChunk = chunkInfo?.chunks[chunkIdx]?.text || candidate?.body || "";
+    const bestChunkPos = chunkInfo?.chunks[chunkIdx]?.pos || 0;
     const trace = rrfTraceByFile?.get(r.file);
     const explainData: HybridQueryExplain | undefined = explain ? {
       ftsScores: trace?.contributions.filter(c => c.source === "fts").map(c => c.backendScore) ?? [],
@@ -5765,12 +5803,15 @@ export async function hybridQuery(
     };
   }).sort((a, b) => b.score - a.score);
 
-  // Step 8: Dedup by file (safety net — prevents duplicate output)
-  const seenFiles = new Set<string>();
+  // Step 8: Dedup by (file, chunk) — safety net against duplicate output.
+  // Keyed on chunk position rather than path so one document may contribute up
+  // to maxPerFile passages; at the default of 1 this is the old file-level dedup.
+  const seenChunks = new Set<string>();
   return blended
     .filter(r => {
-      if (seenFiles.has(r.file)) return false;
-      seenFiles.add(r.file);
+      const key = `${r.file}\u0000${r.bestChunkPos}`;
+      if (seenChunks.has(key)) return false;
+      seenChunks.add(key);
       return true;
     })
     .filter(r => r.score >= minScore)

@@ -2102,6 +2102,17 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 
 // --timeout for `qmd embed`: a cap on the whole embed session, in minutes. Returns
 // the value in milliseconds, or undefined to use the default. 0 disables the cap.
+// --max-per-file for `qmd query`: how many passages one document may contribute.
+// Default 1 reproduces the historic one-result-per-file behaviour.
+function parseMaxPerFileOption(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) {
+    throw new Error(`--max-per-file must be an integer >= 1`);
+  }
+  return n;
+}
+
 function parseEmbedTimeoutOption(value: unknown): number | undefined {
   if (value === undefined) return undefined;
   const minutes = Number(value);
@@ -2314,6 +2325,7 @@ type OutputOptions = {
   candidateLimit?: number;  // Max candidates to rerank (default: 40)
   intent?: string;       // Domain intent for disambiguation
   skipRerank?: boolean;  // Skip LLM reranking, use RRF scores only
+  maxPerFile?: number;   // Max passages returned from one document (default: 1)
   chunkStrategy?: ChunkStrategy;  // "auto" (default) or "regex"
   fullPath?: boolean;    // Show realpath instead of qmd:// URI (relative to $PWD when subpath)
 };
@@ -2947,6 +2959,7 @@ async function querySearch(query: string, opts: OutputOptions, _embedModel: stri
         minScore: opts.minScore || 0,
         candidateLimit: opts.candidateLimit,
         skipRerank: opts.skipRerank,
+        maxPerFile: opts.maxPerFile,
         explain: !!opts.explain,
         intent,
         chunkStrategy: opts.chunkStrategy,
@@ -3049,6 +3062,7 @@ function parseCLI() {
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
+      "max-per-file": { type: "string" },  // query: max passages from one document (default 1)
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -3135,6 +3149,7 @@ function parseCLI() {
     lineNumbers: !!values["line-numbers"],
     candidateLimit: values["candidate-limit"] ? parseInt(String(values["candidate-limit"]), 10) : undefined,
     skipRerank: !!values["no-rerank"],
+    maxPerFile: parseMaxPerFileOption(values["max-per-file"]),
     explain: !!values.explain,
     intent: values.intent as string | undefined,
     chunkStrategy: parseChunkStrategy(values["chunk-strategy"]),
@@ -3591,6 +3606,7 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("    --max-per-file <n>          - Max passages from one document, query only (default 1)");
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
